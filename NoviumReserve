@@ -7,8 +7,7 @@ import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
 import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
-
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol"
 import "./CryptoLandCitizenNFT4124.sol";
 import "./TokenAs2.sol";
 
