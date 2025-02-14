@@ -1,0 +1,421 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/IERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+
+
+interface ICitizenNFT is IERC721 {
+    function mint(address to) external returns (uint256);
+    function resetWeight(uint256 tokenId, address contractAddress) external;
+    function getWeight(uint256 tokenId, address contractAddress) external view returns (uint256);
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+}
+
+interface ITokenB is IERC777 {
+    function mint(address account, uint256 amount) external;
+    function burn(address from, uint256 amount) external;
+}
+
+
+contract PerpetualEquityInvestment is IERC777Recipient, Ownable {
+    using SafeMath for uint256;
+
+    IERC1820Registry private constant _erc1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+
+   
+    IERC777 public tokenA;
+    ITokenB public tokenB;
+    ICitizenNFT public citizenNFT;
+
+    uint256 public constant TOTAL_SHARES = 1_000_000 * 1e18;
+    uint256 public constant INITIAL_BID_PRICE = 0.01 ether;
+    uint256 public currentBidPrice = INITIAL_BID_PRICE;
+    uint256 public extraRewardPercentage = 50;
+    uint256 public dividendPercentage = 50;
+    uint256 public dividendInterval = 365 days;
+    uint256 public constant DIVIDEND_CLAIM_FEE = 0.001 ether;
+    uint256 public constant REGISTRATION_FEE = 0.002 ether;   // Registration equity fee
+
+    // Add state variable declarations here
+    mapping(address => uint256) public lastBalanceUpdateTime;
+    mapping(address => uint256) public lastKnownBalance;
+    
+    mapping(address => uint256) public userNFTIds;
+    mapping(uint256 => bool) public registeredNFTs;
+    
+    event NFTMinted(address indexed user, uint256 tokenId);
+    event NFTRegistered(address indexed user, uint256 tokenId);
+    
+
+    // Add event declarations
+    event BalanceUpdated(
+        address indexed user,
+        uint256 newBalance,
+        uint256 timestamp
+    );
+    event SharesPurchased(address indexed buyer, uint256 amount, uint256 price);
+    event SharesRedeemed(address indexed seller, uint256 amountB, uint256 returnAmountA);
+    event DividendPaid(address indexed recipient, uint256 amount);
+    event BidPriceUpdated(uint256 newPrice);
+    event EthReceiverUpdated(address indexed newEthReceiver);
+    event TokenAReceived(address indexed from, uint256 amount);
+    event DividendNotAvailable(address indexed user, string reason);
+    event DividendDistributed(uint256 amount);
+    event EthForwarded(address indexed receiver, uint256 amount);
+    event DividendWeightUpdated(address indexed user, uint256 weight);
+
+    uint256 public lastDividendDistributionTime;
+    mapping(address => uint256) public lastDividendClaimTime;
+    mapping(address => bool) public hasClaimedFirstDividend;
+    address public ethReceiver;
+
+    uint256 public contractTotalMintedTokenB;
+    uint256 public contractTotalBurnedTokenB;
+    
+
+    mapping(address => uint256) private mintedAmounts;
+    mapping(address => uint256) private burnedAmounts;
+    mapping(address => uint256) public dividendWeights;
+    uint256 public totalWeightedShares;
+
+    constructor(
+        address tokenAAddress,
+        address tokenBAddress,
+        address citizenNFTAddress,
+        address initialOwner,
+        address initialEthReceiver
+    ) Ownable(initialOwner) {
+        tokenA = IERC777(tokenAAddress);
+        tokenB = ITokenB(tokenBAddress);
+        citizenNFT = ICitizenNFT(citizenNFTAddress);
+        ethReceiver = initialEthReceiver;
+        lastDividendDistributionTime = block.timestamp;
+
+        _erc1820.setInterfaceImplementer(
+            address(this),
+            keccak256("ERC777TokensRecipient"),
+            address(this)
+        );
+    }
+   
+      function _purchaseShares() internal {
+        require(msg.value >= INITIAL_BID_PRICE, "Must send at least initial bid price");
+        require(tokenB.totalSupply() < TOTAL_SHARES, "All shares have been issued");
+
+        uint256 effectiveBidPrice = currentBidPrice < INITIAL_BID_PRICE ? INITIAL_BID_PRICE : currentBidPrice;
+        uint256 sharesToMint = (msg.value * 1e18) / effectiveBidPrice;
+        uint256 extraShares = 0;
+        uint256 newBidPrice = effectiveBidPrice;
+
+        if (msg.value >= effectiveBidPrice * 2) {
+            extraShares = (sharesToMint * extraRewardPercentage) / 100;
+            uint256 priceIncrease = (msg.value.sub(effectiveBidPrice)).mul(10).div(100);
+            newBidPrice = effectiveBidPrice.add(priceIncrease);
+        } else if (msg.value > effectiveBidPrice) {
+            newBidPrice = msg.value;
+        }
+
+        uint256 totalSharesToMint = sharesToMint.add(extraShares);
+
+        if (tokenB.totalSupply().add(totalSharesToMint) > TOTAL_SHARES) {
+            totalSharesToMint = TOTAL_SHARES.sub(tokenB.totalSupply());
+        }
+
+        if (totalSharesToMint > 0) {
+            tokenB.mint(msg.sender, totalSharesToMint);
+            contractTotalMintedTokenB = contractTotalMintedTokenB.add(totalSharesToMint);
+            mintedAmounts[msg.sender] = mintedAmounts[msg.sender].add(totalSharesToMint);
+            
+            // Update total weighted shares
+            uint256 weight = dividendWeights[msg.sender] == 0 ? 1 : dividendWeights[msg.sender];
+            totalWeightedShares = totalWeightedShares.add(totalSharesToMint.mul(weight));
+
+            emit SharesPurchased(msg.sender, totalSharesToMint, msg.value);
+        }
+
+        if (newBidPrice > currentBidPrice) {
+            currentBidPrice = newBidPrice;
+            emit BidPriceUpdated(currentBidPrice);
+        }
+
+        payable(ethReceiver).transfer(msg.value);
+    }
+
+
+      receive() external payable {
+        if (msg.value == REGISTRATION_FEE) {
+          // Trigger the registration process
+           registerWithNFT();
+
+        } else if (msg.value == DIVIDEND_CLAIM_FEE) {
+           // Retweet dividend collection fee
+            payable(ethReceiver).transfer(DIVIDEND_CLAIM_FEE);
+            emit EthForwarded(ethReceiver, DIVIDEND_CLAIM_FEE);
+           // Trigger dividend collection
+            claimDividend();
+        } else if (msg.value >= INITIAL_BID_PRICE) {
+            // Trigger share purchase
+            _purchaseShares();
+        } else {
+            revert("Invalid ETH amount");
+        }
+    }
+
+    struct Registration {
+    address userAddress;     // register address
+    uint256 shareAmount;    //number of shares at the time of registration
+    uint256 registeredAt;    // registered time
+    bool isActive;          // status
+   }
+
+   // storage NFT regsister info
+    mapping(uint256 => Registration) public nftRegistrations;
+    //Re-registration is required when equity is reduced/increse to avoid failure of dividend withdrawal
+    function registerWithNFT() internal {
+    require(msg.value == 0.002 ether, "Must send exactly 0.002 ETH");
+    uint256 tokenBBalance = tokenB.balanceOf(msg.sender);
+    require(tokenBBalance > 0, "Must hold TokenB shares");
+
+    uint256 nftBalance = citizenNFT.balanceOf(msg.sender);
+    uint256 tokenId = userNFTIds[msg.sender];
+    
+    // if no NFT，no register，mint a new one
+    if (nftBalance == 0 && tokenId == 0) {
+        tokenId = citizenNFT.mint(msg.sender);
+        userNFTIds[msg.sender] = tokenId;
+        registeredNFTs[tokenId] = true;
+        
+        // register info
+        nftRegistrations[tokenId] = Registration({
+            userAddress: msg.sender,
+            shareAmount: tokenBBalance,
+            registeredAt: block.timestamp,
+            isActive: true
+        });
+
+        citizenNFT.resetWeight(tokenId, address(this));
+        emit NFTMinted(msg.sender, tokenId);
+        return;
+    }
+    
+    // if has NFT but not yet register
+    if (nftBalance > 0 && tokenId == 0) {
+        tokenId = citizenNFT.tokenOfOwnerByIndex(msg.sender, 0);
+        userNFTIds[msg.sender] = tokenId;
+        registeredNFTs[tokenId] = true;
+        
+        // storage info
+        nftRegistrations[tokenId] = Registration({
+            userAddress: msg.sender,
+            shareAmount: tokenBBalance,
+            registeredAt: block.timestamp,
+            isActive: true
+        });
+
+        
+        citizenNFT.resetWeight(tokenId, address(this));
+        emit NFTRegistered(msg.sender, tokenId);
+        return;
+    }
+    
+    // update info
+    nftRegistrations[tokenId] = Registration({
+        userAddress: msg.sender,
+        shareAmount: tokenBBalance,
+        registeredAt: block.timestamp,
+        isActive: true
+    });
+    
+    registeredNFTs[tokenId] = true;
+    
+    citizenNFT.resetWeight(tokenId, address(this));
+    emit NFTRegistered(msg.sender, tokenId);
+}
+ 
+    
+   function claimDividend() internal {
+    uint256 tokenBBalance = tokenB.balanceOf(msg.sender);
+    require(tokenBBalance > 0, "Must hold TokenB shares");
+    
+    uint256 tokenId = userNFTIds[msg.sender];
+    require(tokenId > 0, "No NFT found");
+    require(registeredNFTs[tokenId], "NFT not registered");
+
+    // verify dividend conditions
+    Registration memory reg = nftRegistrations[tokenId];
+    require(reg.isActive, "Registration not active");
+    require(reg.userAddress == msg.sender, "Not registered address");
+    require(tokenBBalance >= reg.shareAmount, "more than registered shares");
+
+    uint256 userDividend = calculateUserDividend(msg.sender);
+    require(userDividend > 0, "No dividend available");
+
+    uint256 contractTokenABalance = tokenA.balanceOf(address(this));
+    require(contractTokenABalance >= userDividend, "Insufficient contract balance");
+
+    tokenA.send(msg.sender, userDividend, "");
+    
+    // update reg.info
+    nftRegistrations[tokenId] = Registration({
+        userAddress: msg.sender,
+        shareAmount: tokenBBalance,
+        registeredAt: block.timestamp,
+        isActive: true
+    });
+    
+    citizenNFT.resetWeight(tokenId, address(this));
+    emit DividendPaid(msg.sender, userDividend);
+   }
+
+    function calculateUserDividend(address user) public view returns (uint256) {
+    uint256 tokenId = userNFTIds[user];
+    require(tokenId > 0, "No NFT found");
+    require(registeredNFTs[tokenId], "NFT not registered");
+
+    uint256 currentBalance = tokenB.balanceOf(user);
+    require(currentBalance > 0, "No token balance");
+
+    uint256 nftWeight = citizenNFT.getWeight(tokenId, address(this));
+    require(nftWeight > 0, "No weight accumulated");
+
+    uint256 contractTokenABalance = tokenA.balanceOf(address(this));
+    uint256 totalDividend = contractTokenABalance.mul(dividendPercentage).div(100);
+    uint256 totalShares = getContractCurrentTokenBSupply();
+
+    // Calculate dividend based on balance and NFT weight
+    uint256 claimPeriod = dividendInterval/86400; // Convert seconds to days
+        
+    // Ensure nftWeight doesn't exceed claim period
+    uint256 effectiveWeight = nftWeight > claimPeriod ? claimPeriod : nftWeight;
+     // calculate weight，amount 
+    uint256 userDividend = totalDividend.mul(currentBalance).mul(effectiveWeight).div(totalShares).div(claimPeriod);
+
+    return userDividend > contractTokenABalance ? contractTokenABalance : userDividend;
+    }
+   
+     function updateUserBalance(address user) internal {
+        uint256 currentBalance = tokenB.balanceOf(user);
+        if (currentBalance != lastKnownBalance[user]) {
+            lastKnownBalance[user] = currentBalance;
+            lastBalanceUpdateTime[user] = block.timestamp;
+            emit BalanceUpdated(user, currentBalance, block.timestamp);
+        }
+    }
+
+    function tokensReceived(
+        address /*operator*/,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata /*userData*/,
+        bytes calldata /*operatorData*/
+    ) external override {
+        if (msg.sender == address(tokenB)) {
+            // Update balances for both sender and receiver
+            updateUserBalance(from);
+            updateUserBalance(to);
+        }
+        
+        if (msg.sender == address(tokenA)) {
+            emit TokenAReceived(from, amount);
+        } else if (msg.sender == address(tokenB)) {
+            _redeemShares(from, amount);
+        } else {
+            revert("Unsupported token");
+        }
+    }
+    
+    function _redeemShares(address account, uint256 amount) internal {
+        require(amount > 0, "Must redeem a positive amount");
+
+        uint256 totalTokenB = tokenB.totalSupply();
+        uint256 totalTokenA = tokenA.balanceOf(address(this));
+        
+        uint256 amountA = amount.mul(totalTokenA).div(totalTokenB);
+        require(amountA <= totalTokenA, "Insufficient TokenA in contract");
+        
+        tokenA.send(account, amountA, "");
+        
+        contractTotalBurnedTokenB = contractTotalBurnedTokenB.add(amount);
+        burnedAmounts[account] = burnedAmounts[account].add(amount);
+
+        if (totalTokenB > amount) {
+            currentBidPrice = currentBidPrice.mul(totalTokenB.sub(amount)).div(totalTokenB);
+        } else {
+            currentBidPrice = INITIAL_BID_PRICE;
+        }
+
+        if (currentBidPrice < INITIAL_BID_PRICE) {
+            currentBidPrice = INITIAL_BID_PRICE;
+        }
+
+        emit BidPriceUpdated(currentBidPrice);
+        emit SharesRedeemed(account, amount, amountA);
+    }
+    
+    // View functions
+    function getContractBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function getContractTotalMintedTokenB() public view returns (uint256) {
+        return contractTotalMintedTokenB;
+    }
+
+    function getContractTotalBurnedTokenB() public view returns (uint256) {
+        return contractTotalBurnedTokenB;
+    }
+
+    function getContractCurrentTokenBSupply() public view returns (uint256) {
+        return contractTotalMintedTokenB.sub(contractTotalBurnedTokenB);
+    }
+
+    function getTokenABalance() public view returns (uint256) {
+        return tokenA.balanceOf(address(this));
+    }
+
+    function getMintedAmount(address account) public view returns (uint256) {
+        return mintedAmounts[account];
+    }
+
+    function getBurnedAmount(address account) public view returns (uint256) {
+        return burnedAmounts[account];
+    }
+
+    // Owner functions
+    function setExtraRewardPercentage(uint256 _percentage) public onlyOwner {
+        extraRewardPercentage = _percentage;
+    }
+
+    function setDividendPercentage(uint256 _percentage) public onlyOwner {
+        require(_percentage <= 100, "Invalid percentage");
+        dividendPercentage = _percentage;
+    }
+
+    function setDividendInterval(uint256 _interval) public onlyOwner {
+        dividendInterval = _interval;
+    }
+
+    function setEthReceiver(address _receiver) public onlyOwner {
+        require(_receiver != address(0), "Invalid address");
+        ethReceiver = _receiver;
+        emit EthReceiverUpdated(_receiver);
+    }
+
+     function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+    
+}
