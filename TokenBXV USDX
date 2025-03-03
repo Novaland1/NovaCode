@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/ERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Sender.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+//The contract consists of two parts: the main contract and voting. The role of voting is based on the practice of liquid democracy. 
+//The community jointly implements the expansion and contraction strategy of the stablecoin system and maintains reasonable market feedback. 
+//Community members can obtain valuable perpetual assets through transactions and record them on the citizen NFTs.
+//that try to democratize money, embed it into the micro level, and solve the impossible triangle problem of moneysystem.
+//Feed the premium of the intermediary directly back to the actual value contribution through inflation.
+
+interface ICryptoLandCitizenNFT412 {
+    function updateValor(uint256 tokenId, int256 valorChange) external;
+    function updateCredit(uint256 tokenId, int256 creditChange) external;
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+}
+
+interface IVoting {
+    function getCurrentVoteRate() external view returns (uint256);
+    function handleVote(address voter, bool isUpVote, uint256 amount) external;
+    function voteUpToken() external view returns (address);
+    function voteDownToken() external view returns (address);
+}
+
+interface ITokenNovaEco is IERC777 {
+    function mint(address to, uint256 amount) external;
+    function burn(uint256 amount, bytes memory data) external;
+    }
+
+contract TokenBXV is ERC777, IERC777Sender, IERC777Recipient, Ownable  {
+   
+    IERC1820Registry private constant erc1820registry = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    AggregatorV3Interface public ethUsdPriceFeed;
+    
+    IVoting public votingContract;
+    ITokenNovaEco public novaEcoToken;
+      
+    uint256 private constant INITIAL_FEE_RATE = 10; // Initial transfer fee: 0.1% (10/10000)
+    uint256 private constant INITIAL_ACCUMULATION_RATE = 1000; // Initial 10% (1000/10000)
+    uint256 private constant INITIAL_UPDATE_FEE = 0.001 ether;
+    uint256 private constant INITIAL_TOKENS_TO_SEND_THRESHOLD = 1* 1e18; // 1000万 tokens
+    
+    uint256 private storedEthUsdPrice;
+    uint256 public lastPriceUpdateTime;
+    uint256 private constant PRICE_UPDATE_INTERVAL = 1 days;
+
+    event VoteUpDestroyed(address from, uint256 amount);
+    event VoteDownDestroyed(address from, uint256 amount);
+    event VoteHandlingFailed(address voter, bool isUpVote, uint256 amount);
+
+    event EthUsdPriceUpdated(uint256 price, uint256 timestamp, string source);
+
+    event NFTContractUpdated(address indexed oldAddress, address indexed newAddress);
+
+    uint256 private feeRate = INITIAL_FEE_RATE;
+    uint256 private accumulationRate = INITIAL_ACCUMULATION_RATE;
+    uint256 private updateFee = INITIAL_UPDATE_FEE;
+    uint256 private tokensToSendThreshold = INITIAL_TOKENS_TO_SEND_THRESHOLD;
+
+    
+
+    // inflation function
+    uint256 private _totalValorhere = 1; // initial set 1，avoid 0 status
+    // Define constants
+    uint256 public minMultiplier = 1e18 / 100;     // 默认1% (0.01 * 1e18)
+    uint256 public maxMultiplier = 5 * 1e18 / 100; // 默认5% (0.5 * 1e18)
+    
+    struct FeeStructure {
+        uint256 threshold;
+        uint256 rate;
+    }
+    FeeStructure[] public feeStructures;
+
+     address public feeRecipient;
+     address public ethRecipient;
+
+    ICryptoLandCitizenNFT412 public nftContract;
+      
+    mapping(address => uint256) public cumulativeCredit;
+    mapping(address => uint256) public cumulativeValor;
+
+    event NFTUpdated(address indexed user, uint256 tokenId, int256 valorChange, int256 creditChange);
+    event FeeStructureUpdated();
+    event TotalValorUpdated(uint256 newTotalValor);
+
+    event VoteUpdated(uint256 upVotes,uint256 downVotes,bool isUpVote,address voter,uint256 amount);
+    
+    constructor(
+    string memory name,
+    string memory symbol,
+    address[] memory defaultOperators,
+    address _feeRecipient,
+    address initialOwner,
+    address _novaEcoToken,
+    address _nftContract,
+    address _ethRecipient,
+    address _ethUsdPriceFeed,
+    
+    address _votingContract    // voting address
+    ) ERC777(name, symbol, defaultOperators) Ownable(initialOwner) {
+        nftContract = ICryptoLandCitizenNFT412(_nftContract);
+        feeRecipient = _feeRecipient;
+        ethRecipient = _ethRecipient;
+        novaEcoToken = ITokenNovaEco(_novaEcoToken);
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+        storedEthUsdPrice = getEthUsdPrice();  // Use function calls instead of variables
+        lastPriceUpdateTime = block.timestamp;
+        votingContract = IVoting(_votingContract);
+
+        // Initialize fee structures
+        feeStructures.push(FeeStructure(100 * 1e18, 1));
+        feeStructures.push(FeeStructure(1000 * 1e18, 3));
+        feeStructures.push(FeeStructure(10000 * 1e18, 5));
+
+        // Register interfaces
+        erc1820registry.setInterfaceImplementer(address(this), keccak256("ERC777TokensSender"), address(this));
+        erc1820registry.setInterfaceImplementer(address(this), keccak256("ERC777TokensRecipient"), address(this));
+
+        emit EthUsdPriceUpdated(storedEthUsdPrice, block.timestamp, "initial");
+    }
+
+    function setVotingContract(address _votingContract) external onlyOwner {
+        require(_votingContract != address(0), "Invalid voting contract");
+        votingContract = IVoting(_votingContract);
+    }
+
+    function totalValorhere() public view returns (uint256) {
+        return _totalValorhere;
+    }
+
+    function updateTotalValorhere(uint256 newValor) private {
+        _totalValorhere = newValor;
+        emit TotalValorUpdated(newValor);
+    }
+
+   function getInflationRate() public view returns (uint256) {
+   uint256 totalSupply = totalSupply();      
+   uint256 adjustedValor = _totalValorhere;  
+   
+   
+   if (adjustedValor >= totalSupply) {
+       return minMultiplier;  
+   }
+   
+  
+   return totalSupply == 0 ? type(uint256).max : 
+          ((totalSupply - adjustedValor) * 1e18) / totalSupply;
+   }
+
+   function calculateIncentiveMultiplier() public view returns (uint256) {
+   uint256 inflationRate = getInflationRate();  // 18 precisions
+   uint256 rawMultiplier = inflationRate < 1e18 ? inflationRate : 0;
+   
+   uint256 voteRate;
+   try votingContract.getCurrentVoteRate() returns (uint256 rate) {
+       voteRate = rate;  // Maintain 18 digits of precision
+   } catch {
+       voteRate = minMultiplier;
+   }
+
+   // Process the precision of one number first, then multiply
+   //uint256 finalMultiplier = ((rawMultiplier / 1e18) * voteRate);
+   // or
+    uint256 finalMultiplier = (rawMultiplier * voteRate)/1e18;
+   
+   return max(minMultiplier, min(maxMultiplier, finalMultiplier));
+   }
+
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a >= b ? a : b;
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a <= b ? a : b;
+    }
+ 
+    function mint(address to, uint256 amount) public {
+        require(isOwnerOrOwnedByOwner(msg.sender), "TokenB: caller is not authorized");
+        _mint(to, amount, "", "");
+    }
+
+    function burn(uint256 amount, bytes memory data) public virtual override{
+   require(isOwnerOrOwnedByOwner(msg.sender), "TokenB: caller is not authorized"); 
+   super.burn(amount, data);
+   }
+
+   function _beforeTokenTransfer(
+    address operator,
+    address from,
+    address to,
+    uint256 amount
+   ) internal virtual override {
+    super._beforeTokenTransfer(operator, from, to, amount);
+
+    uint256 gasStart = gasleft();
+
+    // Distinguish between normal transfers and contract interactions
+    if (from != address(0) && to != address(0)) { // Normal transfer
+        if (amount >= 1e18) {  //Minimum threshold
+            uint256 fee = calculateFee(amount);
+            if (fee > 0) {
+                _send(from, feeRecipient, fee, "", "", false);
+            }
+            
+            // Reward calculation
+            uint256 incentiveMultiplier = calculateIncentiveMultiplier();
+            uint256 reward = (amount * incentiveMultiplier)/1e18;
+            
+            updateTotalValorhere(totalValorhere() + reward); 
+            cumulativeCredit[from] += reward;
+            cumulativeValor[from] += reward;
+            cumulativeValor[to] += reward;
+        }
+    }
+
+    // Gas calculation remains unchanged
+    if (from != address(0)) {
+        uint256 gasUsed = gasStart - gasleft();
+        uint256 ethUsdPrice = getEthUsdPrice();
+        uint256 gasValor = (gasUsed * tx.gasprice * ethUsdPrice)/1e18;  
+        cumulativeValor[from] += gasValor;
+    }
+
+    if (block.timestamp >= lastPriceUpdateTime + PRICE_UPDATE_INTERVAL) {
+        updateEthUsdPrice();
+    }
+}
+
+   function calculateFee(uint256 amount) internal view returns (uint256) {
+    // Traverse from large to small and find the first threshold that meets the conditions
+    for (uint i = feeStructures.length; i > 0; i--) {
+        if (amount >= feeStructures[i-1].threshold) {
+            uint256 feeAmount = (amount * feeStructures[i-1].rate) / 1000;
+            require(feeAmount <= amount, "Fee exceeds amount");  // Security check
+            return feeAmount;
+        }
+    }
+    // Default rate for minimum amount
+    return (amount * 1) / 1000;  // 0.1% as default fee
+}
+
+   function getEthUsdPrice() public view returns (uint256) {
+    try ethUsdPriceFeed.latestRoundData() returns (
+        uint80,
+        int256 answer,
+        uint256,
+        uint256 updatedAt,
+        uint80
+    ) {
+        if(updatedAt != 0 && answer > 0) {
+            return uint256(answer) * 1e10;  // convert to 1e18
+        }
+    } catch {}
+    
+    return storedEthUsdPrice; // if call failure, return last stored value
+    }
+
+    function updateEthUsdPrice() internal {
+    try ethUsdPriceFeed.latestRoundData() returns (
+        uint80,
+        int256 answer,
+        uint256,
+        uint256 updatedAt,
+        uint80
+    ) {
+        if(updatedAt != 0 && answer > 0) {
+            storedEthUsdPrice = uint256(answer) * 1e10;  // modifly to 1e18
+            lastPriceUpdateTime = block.timestamp;
+        }
+    } catch {}
+}
+
+    receive() external payable {
+    require(msg.value == updateFee, "Incorrect ETH amount");
+    
+    uint256 balance = nftContract.balanceOf(msg.sender);
+    require(balance > 0, "No NFT owned");
+    uint256 tokenId = nftContract.tokenOfOwnerByIndex(msg.sender, balance - 1);
+
+    uint256 gasUsed = gasleft();
+    int256 valorChange = int256(cumulativeValor[msg.sender] / 1e12); //update with 1e6
+    int256 creditChange = int256(cumulativeCredit[msg.sender] / 1e12);//update with 1e6
+    
+    uint256 ethUsdPrice = getEthUsdPrice();
+    uint256 gasValor = (gasUsed * tx.gasprice * ethUsdPrice )/ 1e18 ;//update with 1e6.reducing to 1e18
+    nftContract.updateValor(tokenId, valorChange + int256(gasValor));
+    nftContract.updateCredit(tokenId, creditChange);
+    
+    novaEcoToken.mint(msg.sender,  gasValor*1e12);
+
+    cumulativeValor[msg.sender] = 0;
+    cumulativeCredit[msg.sender] = 0;
+
+    emit NFTUpdated(msg.sender, tokenId, valorChange + int256(gasValor), creditChange);
+
+    (bool sent, ) = ethRecipient.call{value: msg.value}("");
+    require(sent, "Failed to send ETH");
+    }
+
+    function setEthRecipient(address _newRecipient) external onlyOwner {
+        require(_newRecipient != address(0), "Invalid address");
+        ethRecipient = _newRecipient;
+    }
+
+       function setMinMultiplier(uint256 _newMinMultiplier) external onlyOwner {
+        require(_newMinMultiplier <= maxMultiplier, "Min multiplier must be less than or equal to max multiplier");
+        minMultiplier = _newMinMultiplier;
+    }
+
+    // The setter function is used to modify maxMultiplier
+    function setMaxMultiplier(uint256 _newMaxMultiplier) external onlyOwner {
+        require(_newMaxMultiplier >= minMultiplier, "Max multiplier must be greater than or equal to min multiplier");
+        maxMultiplier = _newMaxMultiplier;
+    }
+
+    function withdrawETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        (bool sent, ) = msg.sender.call{value: balance}("");
+        require(sent, "Failed to send ETH");
+    }
+
+   function tokensReceived(
+    address,
+    address from,
+    address,
+    uint256 amount,
+    bytes calldata,
+    bytes calldata
+  ) external override {
+    bool isUpVote = (msg.sender == votingContract.voteUpToken());
+    
+   // Destroy tokens and send events first
+    if(isUpVote) {
+        emit VoteUpDestroyed(from, amount);
+    } else {
+        emit VoteDownDestroyed(from, amount);
+    }
+    ERC777(msg.sender).burn(amount, "");
+    
+    uint256 gasUsed = gasleft();
+    gasUsed = gasUsed - gasleft();
+    uint256 ethUsdPrice = getEthUsdPrice();
+    uint256 gasValor = (gasUsed * tx.gasprice * ethUsdPrice )/ 1e30 ;//update with 1e6.reducing to 1e18
+   
+    novaEcoToken.mint(from,  gasValor*2*1e12);
+
+    // Try calling voting again to process the vote
+    try votingContract.handleVote(from, isUpVote, amount) {
+    } catch {
+        // Here, we only need to log the exception, but do not need to roll back the entire transaction
+        emit VoteHandlingFailed(from, isUpVote, amount);
+    }
+   }
+   
+    function tokensToSend(
+    address /*operator*/,
+    address /*from*/,
+    address /*to*/,
+    uint256 /*amount*/,
+    bytes calldata /*userData*/,
+    bytes calldata /*operatorData*/
+    ) external {
+    // reserved for....
+    }
+
+   
+    function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+
+   
+    function setAccumulationRate(uint256 _newRate) external onlyOwner {
+        accumulationRate = _newRate;
+    }
+
+   
+    function setTokensToSendThreshold(uint256 _newThreshold) external onlyOwner {
+        tokensToSendThreshold = _newThreshold;
+    }
+
+    function getValor(address user) public view returns (uint256) {
+        return cumulativeValor[user];
+    }
+
+    function getCredit(address user) public view returns (uint256) {
+        return cumulativeCredit[user];
+    }
+
+    function setTotalValorhere(uint256 newValue) external onlyOwner {
+    require(newValue > 0, "Value must be greater than 0");
+    require(newValue <= type(uint256).max / 1e18, "Value too large"); // Prevent overflow during inflation calculation
+    _totalValorhere = newValue;
+    emit TotalValorUpdated(newValue);
+    }
+
+    function setNFTContract(address _nftContractAddress) external onlyOwner {
+    require(_nftContractAddress != address(0), "Invalid address");
+    nftContract = ICryptoLandCitizenNFT412(_nftContractAddress);
+    emit NFTContractUpdated(address(nftContract), _nftContractAddress);
+}
+
+}
