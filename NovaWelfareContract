@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/ERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+    interface ICryptoLandCitizenNFT412 {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function getValor(uint256 tokenId) external view returns (uint256);
+    function getCredit(uint256 tokenId) external view returns (uint256);
+    function getWeight(uint256 tokenId, address contractAddress) external view returns (uint256);
+    function updateValor(uint256 tokenId, int256 valorChange) external;
+    function updateCredit(uint256 tokenId, int256 creditChange) external;
+    function getTotalValor() external view returns (uint256) ;
+    
+    function resetWeight(uint256 tokenId, address contractAddress) external;
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+    }
+
+    interface ICryptoSovereignReserve {
+    function calculateAnnualValorReturn() external view returns (uint256);
+    }
+
+    interface ITokenNovaEco  {
+    function mint(address to, uint256 amount) external;
+    function burn(uint256 amount, bytes memory data) external;
+    }
+
+    interface IVoting {
+    function getCurrentVoteRate() external view returns (uint256);
+    function handleVote(address voter, bool isUpVote, uint256 amount) external;
+    function voteUpToken() external view returns (address);
+    function voteDownToken() external view returns (address);
+    }
+
+    interface ITokenBXV {
+    function getInflationRate() external view returns (uint256);
+    function mint(address to, uint256 amount) external;
+    function burn(uint256 amount, bytes memory data) external; 
+    function totalValorhere() external view returns (uint256) ;
+        
+    }
+    
+
+   contract NovaWelfareCenter is IERC777Recipient, Ownable, ReentrancyGuard {
+    IERC1820Registry private constant _erc1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    AggregatorV3Interface public ethUsdPriceFeed;
+
+    ITokenBXV public tokenB;
+    ICryptoLandCitizenNFT412 public citizenNFT;
+    ICryptoSovereignReserve public sovereignReserve;
+    ITokenNovaEco public novaEcoToken;
+    IVoting public votingContract;
+    
+   // Add event declaration
+    event VoteUpDestroyed(address indexed from, uint256 amount);
+    event VoteDownDestroyed(address indexed from, uint256 amount);
+    event VoteHandlingFailed(address indexed from, bool isUpVote, uint256 amount);
+
+    uint256 public constant CLAIM_FEE = 0.001 ether;
+    uint256 public constant DISCOUNT_FEE = 0.002 ether;
+    address public ethRecipient;
+
+    uint256 public constant INSURANCE_FEE = 0.005 ether;
+    uint256 public constant INSURANCE_THRESHOLD = 5000 * 1e6;  // 5000 with 1e6 precision
+    uint256 public constant INSURANCE_MULTIPLIER =10;
+    uint256 public constant MAX_INSURANCE_AMOUNT = 1000000 * 1e18; // 1 million upper limit, 18-bit precision
+
+    event InsuranceClaimed(
+        address indexed user, 
+        uint256 tokenId, 
+        uint256 valorAmount, 
+        uint256 creditAmount, 
+        uint256 insuranceAmount
+    );
+    
+    uint256 private storedEthUsdPrice;
+    uint256 public lastPriceUpdateTime;
+    event EthUsdPriceUpdated(uint256 price, uint256 timestamp, string source);
+
+    event InterestClaimed(address indexed user, uint256 interestTokens, uint256 tokenId);
+    event CitizenNFTAddressUpdated(address newAddress);
+    event TokenBAddressUpdated(address newAddress);
+    event EthRecipientUpdated(address newRecipient);
+    event EthReceived(address indexed from, uint256 amount);
+    event ValorDiscounted(address indexed user, uint256 tokenId, uint256 discountedValor, uint256 mintedTokenB);
+    event TokenBReceived(address indexed from, uint256 amount, uint256 tokenId, int256 valorIncrease);
+
+    event NFTContractUpdated(address indexed oldAddress, address indexed newAddress);  
+
+    constructor(
+        address tokenBAddress,
+        address citizenNFTAddress,
+        address sovereignReserveAddress,
+        address _novaEcoToken,
+        address _ethUsdPriceFeed,
+        address initialEthRecipient,
+        address _votingContract
+    ) Ownable(msg.sender) {
+        require(tokenBAddress != address(0) && 
+                citizenNFTAddress != address(0) && 
+                sovereignReserveAddress != address(0) &&
+                _votingContract != address(0), 
+                "Zero address");
+        
+        tokenB = ITokenBXV(tokenBAddress);
+        citizenNFT = ICryptoLandCitizenNFT412(citizenNFTAddress);
+        sovereignReserve = ICryptoSovereignReserve(sovereignReserveAddress);
+        novaEcoToken = ITokenNovaEco(_novaEcoToken);
+        votingContract = IVoting(_votingContract);
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+        storedEthUsdPrice = getEthUsdPrice();  // Use function calls instead of variables
+        lastPriceUpdateTime = block.timestamp;
+        ethRecipient = initialEthRecipient;
+       
+        _erc1820.setInterfaceImplementer(address(this), keccak256("ERC777TokensRecipient"), address(this));
+
+        emit EthUsdPriceUpdated(storedEthUsdPrice, block.timestamp, "initial");
+    }
+
+    function getEthUsdPrice() public view returns (uint256) {
+    try ethUsdPriceFeed.latestRoundData() returns (
+        uint80,
+        int256 answer,
+        uint256,
+        uint256 updatedAt,
+        uint80
+    ) {
+        if(updatedAt != 0 && answer > 0) {
+            return uint256(answer) * 1e10;  // convert to 1e18
+        }
+    } catch {}
+    
+    return storedEthUsdPrice; // if call failure, return last stored value
+    }
+
+    function updateEthUsdPrice() internal {
+    try ethUsdPriceFeed.latestRoundData() returns (
+        uint80,
+        int256 answer,
+        uint256,
+        uint256 updatedAt,
+        uint80
+    ) {
+        if(updatedAt != 0 && answer > 0) {
+            storedEthUsdPrice = uint256(answer) * 1e10;  // modifly to 1e18
+            lastPriceUpdateTime = block.timestamp;
+        }
+    } catch {}
+    }
+   
+    
+     function setVotingContract(address _votingContract) external onlyOwner {
+        require(_votingContract != address(0), "Invalid address");
+        votingContract = IVoting(_votingContract);
+    }
+    
+
+      receive() external payable {
+        if (msg.value == CLAIM_FEE) {
+            claimInterest();
+        } else if (msg.value == DISCOUNT_FEE) {
+            discountValor();
+        } else if (msg.value == INSURANCE_FEE) {
+            claimInsurance();
+        } else {
+            emit EthReceived(msg.sender, msg.value);
+        }
+    }
+    
+    function claimInsurance() public payable nonReentrant {
+    require(msg.value == INSURANCE_FEE, "Incorrect ETH amount for claiming insurance");
+
+    uint256 tokenId = citizenNFT.tokenOfOwnerByIndex(msg.sender, 0);
+    require(citizenNFT.ownerOf(tokenId) == msg.sender, "Not the owner of the token");
+        
+    uint256 valor = citizenNFT.getValor(tokenId);
+    uint256 credit = citizenNFT.getCredit(tokenId);
+    uint256 weight = citizenNFT.getWeight(tokenId, address(this));
+    
+    require(valor >= INSURANCE_THRESHOLD, "Insufficient Valor for insurance");
+    require(credit >= INSURANCE_THRESHOLD, "Insufficient Credit for insurance");
+    require(weight >= 30, "Minimum 30 days weight required"); 
+    uint256 inflationRate = tokenB.getInflationRate();
+    require(inflationRate > 0, "Invalid inflation rate");
+    
+   // Calculate the insurance amount in steps to avoid overflow
+   // 1. Calculate the weight factor
+    uint256 weightFactor = (weight * 1e18) / (365 * 10); // Annualized and multiplied by 10
+    
+   // 2. Basic amount calculation
+    uint256 baseAmount = valor * INSURANCE_MULTIPLIER;
+    
+    // 3. Add precision adjustment and inflation rate
+    uint256 withInflation = (baseAmount * 1e12 * (1 + inflationRate)) / 1e18;
+    
+   // 4. Apply weight factor
+    uint256 insuranceAmount = (withInflation * weightFactor) / 1e18;
+    
+    // 5. Apply upper limit
+    insuranceAmount = insuranceAmount > MAX_INSURANCE_AMOUNT ? MAX_INSURANCE_AMOUNT : insuranceAmount;
+        
+   // Perform casting and state update
+    tokenB.mint(msg.sender, insuranceAmount);
+    citizenNFT.updateValor(tokenId, -int256(valor));
+    citizenNFT.updateCredit(tokenId, -int256(credit));
+    citizenNFT.resetWeight(tokenId, address(this));
+
+    emit InsuranceClaimed(msg.sender, tokenId, valor, credit, insuranceAmount);
+    payable(ethRecipient).transfer(INSURANCE_FEE);
+    }
+
+    function getInsuranceMultiplier(uint256 tokenId) public view returns (uint256) {
+    uint256 weight = citizenNFT.getWeight(tokenId, address(this));
+    return (weight * 1e18) / (365 * 1e18);
+    }
+
+
+    function claimInterest() public payable nonReentrant {
+        require(msg.value == CLAIM_FEE, "Incorrect ETH amount for claiming interest");
+
+        uint256 tokenId = citizenNFT.tokenOfOwnerByIndex(msg.sender, 0);
+        require(citizenNFT.ownerOf(tokenId) == msg.sender, "Not the owner of the token");
+        
+        uint256 valor = citizenNFT.getValor(tokenId);
+        require(valor > 0, "No Valor balance");
+
+        uint256 weight = citizenNFT.getWeight(tokenId, address(this));
+        require(weight > 0, "Must wait for weight accumulation");
+        uint256 interestTokens = calculateInterest(valor, weight);
+        
+        require(interestTokens > 0, "Current data inflation is too low");
+
+        if (interestTokens > 0) {
+            tokenB.mint(msg.sender, interestTokens/1e18);
+            citizenNFT.resetWeight(tokenId, address(this));
+        }
+
+        emit InterestClaimed(msg.sender, interestTokens, tokenId);
+        payable(ethRecipient).transfer(CLAIM_FEE);
+    }
+
+   
+  function calculateInterest(uint256 valor, uint256 weight) internal view returns (uint256) {
+    uint256 votingRate = votingContract.getCurrentVoteRate();
+    uint256 tokenBXVvalor = tokenB.totalValorhere();
+    uint256 totalValorNFT = citizenNFT.getTotalValor(); 
+    
+    // 1. First calculate the annual basic return rate
+    // Multiply totalValorNFT by 1e12 to unify the precision
+    uint256 adjustedTotalValorNFT = totalValorNFT * 1e12;
+    uint256 baseRate = (sovereignReserve.calculateAnnualValorReturn() * adjustedTotalValorNFT) / 1e18;
+    
+   // 2. Calculate the denominator (tokenBXVvalor + adjustedTotalValorNFT)
+    uint256 denominator = tokenBXVvalor + adjustedTotalValorNFT;
+    
+    // 3. Calculate the final interest step by step, paying attention to the accuracy of each step
+    uint256 step1 = (valor * 1e12) * weight;  // valor adjusted to 1e18
+    uint256 step2 = (step1 * votingRate) / 1e18;  // votingRate assumes 1e18 precision
+    uint256 step3 = (step2 * baseRate) / denominator;
+    uint256 step4 = (step3 * 365 * 100) / 10000; // Annualization calculation and base rate adjustment
+    
+    return step4/100;//2-digit restoration accuracy
+}
+
+    function discountValor() public payable nonReentrant {
+        require(msg.value == DISCOUNT_FEE, "Must send DISCOUNT_FEE");
+
+        uint256 tokenId = citizenNFT.tokenOfOwnerByIndex(msg.sender, 0);
+        require(citizenNFT.ownerOf(tokenId) == msg.sender, "Not the owner of the token");
+        
+        uint256 valor = citizenNFT.getValor(tokenId);
+        require(valor > 0, "No Valor balance");
+
+        uint256 weight = citizenNFT.getWeight(tokenId, address(this));
+        uint256 weightFactor = (weight * 1e18);
+        weightFactor = weightFactor / 365;
+        weightFactor = weightFactor > 1e18 ? 1e18 : weightFactor;
+        require(weightFactor > 0, "Must wait for weight accumulation");
+
+        uint256 inflationRate = tokenB.getInflationRate();
+        uint256 discountedValor = ((valor * 1e12) * inflationRate * weightFactor) / (1e18 * 1e18 );
+        
+        require(discountedValor > 0, "Nothing to discount");
+        tokenB.mint(msg.sender, discountedValor);
+        
+        int256 valorChange = -int256(discountedValor)/1e12;
+        citizenNFT.updateValor(tokenId, valorChange);
+        citizenNFT.resetWeight(tokenId, address(this));
+
+        emit ValorDiscounted(msg.sender, tokenId, discountedValor, discountedValor);
+        payable(ethRecipient).transfer(msg.value);
+    }
+
+    function tokensReceived(
+    address /*operator*/,
+    address from,
+    address /*to*/,
+    uint256 amount,
+    bytes calldata /*userData*/,
+    bytes calldata /*operatorData*/
+   ) external override {
+    // Check if the sender is a voting token or TokenB
+    if (msg.sender == votingContract.voteUpToken() || msg.sender == votingContract.voteDownToken()) {
+        bool isUpVote = (msg.sender == votingContract.voteUpToken());
+        
+        // Calculate gas compensation
+        uint256 gasUsed = gasleft();
+        uint256 ethUsdPrice = getEthUsdPrice();  
+        uint256 gasValor = (gasUsed * tx.gasprice * ethUsdPrice) / 1e18;  
+        uint256 rewardAmount = (10 * 1e18 + gasValor * 5);
+        
+        // Mint reward tokens
+        novaEcoToken.mint(from, rewardAmount);
+        
+        //Send the corresponding event
+        if (isUpVote) {
+            emit VoteUpDestroyed(from, amount);
+        } else {
+            emit VoteDownDestroyed(from, amount);
+        }
+        
+       // Destroy voting tokens
+        ERC777(msg.sender).burn(amount, "");
+        
+        // Process the vote
+        try votingContract.handleVote(from, isUpVote, amount) {
+        } catch {
+            emit VoteHandlingFailed(from, isUpVote, amount);
+        }
+    } 
+    //TokenB processing logic
+    else if (msg.sender == address(tokenB)) {
+        uint256 tokenId = citizenNFT.tokenOfOwnerByIndex(from, 0);
+        
+       // Verify the condition
+        require(citizenNFT.ownerOf(tokenId) == from, "Not the owner of the token");
+        
+        uint256 valor = citizenNFT.getValor(tokenId);
+        uint256 credit = citizenNFT.getCredit(tokenId);
+        uint256 weight = citizenNFT.getWeight(tokenId, address(this));
+        
+        require(valor >= 2000 * 1e6, "Insufficient Valor for deposit");
+        require(credit >= 2000 * 1e6, "Insufficient Credit for deposit");
+        require(weight >= 30, "Minimum weight requirement not met");
+        require(amount <= valor * 1e12, "Deposit amount exceeds valor");
+        
+        
+        int256 valorChange = int256(amount) / 1e12;
+        
+        citizenNFT.updateValor(tokenId, valorChange);
+        citizenNFT.resetWeight(tokenId, address(this));  
+        //  burn TokenB
+        tokenB.burn(amount, "");  
+        // Mint reward
+        novaEcoToken.mint(from, (10 * 1e18));
+        emit TokenBReceived(from, amount, tokenId, valorChange);
+    } 
+    else {
+        revert("Invalid token received");
+    }
+    }
+
+
+    function setTokenBAddress(address newAddress) external onlyOwner {
+        require(newAddress != address(0), "Invalid address");
+        tokenB = ITokenBXV(newAddress);
+        emit TokenBAddressUpdated(newAddress);
+    }
+
+    function setCitizenNFTAddress(address newAddress) external onlyOwner {
+        require(newAddress != address(0), "Invalid address");
+        citizenNFT = ICryptoLandCitizenNFT412(newAddress);
+        emit CitizenNFTAddressUpdated(newAddress);
+    }
+
+    function setSovereignReserveAddress(address newAddress) external onlyOwner {
+        require(newAddress != address(0), "Invalid address");
+        sovereignReserve = ICryptoSovereignReserve(newAddress);
+    }
+
+    function setEthRecipient(address newRecipient) external onlyOwner {
+        require(newRecipient != address(0), "Invalid address");
+        ethRecipient = newRecipient;
+        emit EthRecipientUpdated(newRecipient);
+    }
+
+    function getContractName() external pure returns (string memory) {
+        return "Nova Welfare Center";
+    }
+
+    function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+}
