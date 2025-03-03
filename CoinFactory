@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/IERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Sender.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+interface ICryptoSovereignReserve {
+    function getTokenACurrentValue() external view returns (uint256);
+}
+
+interface ITokenBXV is IERC777 {
+    function mint(address to, uint256 amount) external;
+    function burn(uint256 amount, bytes memory data) external ;
+    function calculateIncentiveMultiplier() external view returns (uint256);
+    function totalSupply() external view returns (uint256);  
+}
+
+interface ICryptoLandCitizenNFT412 {
+    function balanceOf(address owner) external view returns (uint256);
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+    function updateValor(uint256 tokenId, int256 valor) external;
+}
+
+
+contract CryptoCoinFactory is IERC777Recipient, IERC777Sender, Ownable {
+    IERC1820Registry private constant _erc1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+
+    IERC777 public tokenA;
+    ITokenBXV public tokenB;
+    ICryptoSovereignReserve public miningContract;
+    ICryptoLandCitizenNFT412 public nftContract;
+
+    AggregatorV3Interface public ethUsdPriceFeed;
+
+    
+    uint256 private constant DECIMALS = 10**18;
+    uint256 public lastExchangeRate; // Add the latest exchange rate record
+
+    mapping(address => uint256) private mintedAmounts;
+    mapping(address => uint256) private burnedAmounts;
+
+    address public reserveAddress;
+
+    event FeeCollected(address indexed from, uint256 value);
+    event Withdrawal(address indexed owner, uint256 value);
+    event ExchangeRateUpdated(uint256 indexed rate, uint256 timestamp);
+    event ValorUpdated(address indexed user, uint256 newValor);
+    event GasCompensated(uint256 indexed tokenId, uint256 usdValue, uint256 gasUsed);
+   
+
+    constructor(
+        address tokenAAddress,
+        address tokenBAddress,
+        address miningContractAddress,
+        address initialOwner,
+        address _nftContractAddress,
+        address _ethUsdPriceFeed
+    ) Ownable(initialOwner) {
+        tokenA = IERC777(tokenAAddress);
+        tokenB = ITokenBXV(tokenBAddress);
+        miningContract = ICryptoSovereignReserve(miningContractAddress);
+        nftContract = ICryptoLandCitizenNFT412(_nftContractAddress);
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+
+        // Register two interfaces
+        _erc1820.setInterfaceImplementer(
+            address(this),
+            keccak256("ERC777TokensRecipient"),
+            address(this)
+        );
+
+        _erc1820.setInterfaceImplementer(
+            address(this),
+            keccak256("ERC777TokensSender"),
+            address(this)
+        );
+    }
+
+   // Add a new function to set TokenB address
+    function setTokenB(address newTokenBAddress) external onlyOwner {
+        require(newTokenBAddress != address(0), "Invalid TokenB address");
+        require(newTokenBAddress != address(tokenB), "New address is the same as current");
+        
+        address oldTokenB = address(tokenB);
+        tokenB = ITokenBXV(newTokenBAddress);
+        emit TokenBUpdated(oldTokenB, newTokenBAddress);
+    }
+     event TokenBUpdated(address indexed oldTokenBAddress, address newTokenBAaddress);
+
+    // Add a new function to set TokenB address
+    function setTokenA(address newTokenAAddress) external onlyOwner {
+        require(newTokenAAddress != address(0), "Invalid TokenA address");
+        require(newTokenAAddress != address(tokenA), "New address is the same as current");
+        
+        address oldTokenA = address(tokenA);
+        tokenA = IERC777(newTokenAAddress);
+        emit TokenBUpdated(oldTokenA, newTokenAAddress);
+    }
+     event TokenAUpdated(address indexed oldTokenAAddress, address newTokenAAaddress);
+
+
+     function getLatestETHPrice() public view returns (uint256) {
+        (, int256 price,,,) = ethUsdPriceFeed.latestRoundData();
+        require(price > 0, "Invalid ETH price");
+        return uint256(price);
+    }
+
+  
+    function getRate() public view returns (uint256) {
+    
+    uint256 tokenAValue = miningContract.getTokenACurrentValue();
+    if (tokenAValue == 0 && lastExchangeRate > 0) {
+        return lastExchangeRate;
+    }
+
+    if (tokenAValue == 0) {
+        return 0;
+    }
+
+    return tokenAValue ;  
+    }
+
+   
+    function tokensReceived(
+    address,  // operator
+    address from,  
+    address,  // to
+    uint256 amount,  
+    bytes calldata,  
+    bytes calldata   
+    ) external override {
+   if (msg.sender == address(tokenA)) {
+   uint256 currentRate = getRate();  // 1e24 precision
+   require(currentRate > 0, "No valid exchange rate available");
+
+   uint256 redemptionRate = 0;  
+   uint256 useRate = currentRate*1e4; // default rate
+   
+   // First check if the balance is greater than 0
+   if (tokenA.balanceOf(address(this)) > 0) {
+       redemptionRate = getAmountAForTokenB(DECIMALS) ;
+       if (redemptionRate > 1) {  // Ensure meaningful redemption rates
+           
+           if (redemptionRate > 0 && useRate <= redemptionRate) {
+              useRate = 1e18*1e18/redemptionRate; 
+           }
+       }
+   }
+
+   uint256 amountB = (amount * useRate/1e18);
+   tokenB.mint(from, amountB);
+   
+    lastExchangeRate = useRate;  // Add this line
+    emit ExchangeRateUpdated(useRate, block.timestamp);
+    updateNFTValorIfExists(from, amount);
+
+    }
+
+   else if (msg.sender == address(tokenB)) {
+    uint256 amountA = getAmountAForTokenB(amount);
+    require(amountA > 0, "Invalid redemption rate");
+    require(tokenA.balanceOf(address(this)) >= amountA, "Insufficient TokenA");
+
+    tokenA.send(from, amountA, "");
+    // Receive TokenB first and then destroy it, so there will be a balance in the contract
+    tokenB.burn(amount, "");
+    
+   // Exchange rate calculation
+    uint256 currentTokenABalance = tokenA.balanceOf(address(this));
+    uint256 currentTotalSupplyB = tokenB.totalSupply();
+    uint256 currentRate = (currentTokenABalance * 1e18) / currentTotalSupplyB;
+    
+    lastExchangeRate = currentRate;
+    emit ExchangeRateUpdated(currentRate, block.timestamp);
+
+    updateNFTValorIfExists(from, amount);
+}
+    else {
+        revert("Unsupported token");
+    }
+    }
+
+
+    function checkValues() public view returns (
+    uint256 getrate,
+    uint256 redemption,
+    uint256 adjusted,
+    uint256 lastRate
+) {
+    getrate = getRate();
+    uint256 redemptionRate = getAmountAForTokenB(DECIMALS) ;
+    adjusted = redemptionRate/1e18;
+    lastRate = lastExchangeRate;
+    return (getrate, redemptionRate, adjusted, lastRate);
+}
+
+   
+function getAmountAForTokenB(uint256 amountB) public view  returns (uint256) {
+    uint256 tokenABalance = tokenA.balanceOf(address(this));
+    uint256 totalSupplyB = tokenB.totalSupply();
+    uint256 reservedTokenB = tokenB.balanceOf(reserveAddress);
+    uint256 circulatingSupplyB = totalSupplyB - reservedTokenB;
+    
+    if (tokenABalance == 0 || circulatingSupplyB == 0) {
+        return 0;
+    }
+
+    uint256 baseRate = (tokenABalance * 1e18) / circulatingSupplyB;
+    return (amountB * baseRate) / 1e18;
+}
+
+function setReserveAddress(address _reserveAddress) external onlyOwner {
+         reserveAddress = _reserveAddress;
+}
+
+function testAmountAForTokenB(uint256 amountB) public view returns (
+    uint256 tokenABalance, 
+    uint256 circulatingSupplyB,  //Change to circulation
+    uint256 exchangeAmount,
+    uint256 reservedAmount      // Increase the reserved amount display
+) {
+    tokenABalance = tokenA.balanceOf(address(this));
+    uint256 totalSupplyB = tokenB.totalSupply();
+    uint256 reservedTokenB = tokenB.balanceOf(reserveAddress);  // Need to add reserveAddress variable
+    // Calculate the actual circulation
+    circulatingSupplyB = totalSupplyB - reservedTokenB;
+    
+   // Calculate the exchange rate using the actual circulation
+    uint256 baseRate = (tokenABalance * 1e18) / circulatingSupplyB;
+    exchangeAmount = (amountB * baseRate) / 1e18;
+    
+    return (tokenABalance, circulatingSupplyB, exchangeAmount, reservedTokenB);
+}
+
+
+    
+    function tokensToSend(
+    address _operator,
+    address _from,
+    address _to,
+    uint256 _amount,
+    bytes calldata _userData,
+    bytes calldata _operatorData
+    ) external override {
+    // empty implementation
+    }
+
+    // Add auxiliary function to view intermediate values
+    function getTotalSupplyB() external view returns (uint256) {
+    return tokenB.totalSupply();
+    }
+
+    function getTokenABalanceTest() external view returns (uint256) {
+    return tokenA.balanceOf(address(this));
+    }
+
+    
+    function updateNFTValorIfExists(address user, uint256 amount) internal {
+    uint256 nftBalance = nftContract.balanceOf(user);
+    if (nftBalance > 0) {
+        uint256 tokenId = nftContract.tokenOfOwnerByIndex(user, 0);
+        uint256 gasStart = gasleft();
+        
+        // Calculate the number of TokenB
+        uint256 tokenBAmount;
+        if (msg.sender == address(tokenB)) {
+            tokenBAmount = amount;  // If it is sent by TokenB, use amount directly
+        } else {
+            // If TokenA is sent to mint TokenB, calculate the number of TokenB
+            uint256 useRate = lastExchangeRate;  // Use the latest exchange rate
+            tokenBAmount = (amount * useRate)/1e18;
+        }
+
+       // Get ETH price
+        uint256 currentEthPrice = getLatestETHPrice();
+        uint256 multiplier = tokenB.calculateIncentiveMultiplier();
+        
+        uint256 gasUsed = gasStart - gasleft();
+        uint256 gasCostInWei = gasUsed * tx.gasprice;
+        
+       // Calculate the value using the amount of TokenB
+        uint256 valorInUsd = (tokenBAmount * multiplier) / DECIMALS;
+        uint256 gasCostInUsd = (gasCostInWei * currentEthPrice) / 1e18;
+        
+        uint256 totalUsdValue = valorInUsd/1e10 + gasCostInUsd;// /1e10 adjusts Valor update precision
+        int256 valor;
+        
+        if (msg.sender == address(tokenB)) {
+            valor = -int256((totalUsdValue * 1e6) / 1e8);
+        } else {
+            valor = int256((totalUsdValue * 1e6) / 1e8);
+        }
+        
+        try nftContract.updateValor(tokenId, valor) {
+            emit ValorUpdated(user, uint256(valor > 0 ? valor : -valor));
+            emit GasCompensated(tokenId, gasCostInUsd, gasUsed);
+        } catch {
+           // Continue even if valor update fails
+        }
+    }
+
+    }
+   
+    // Add a function to update the oracle address
+    function setEthUsdPriceFeed(address _priceFeed) external onlyOwner {
+        require(_priceFeed != address(0), "Invalid price feed address");
+        ethUsdPriceFeed = AggregatorV3Interface(_priceFeed);
+    }
+    
+ 
+    function getMintedAmount(address account) public view returns (uint256) {
+        return mintedAmounts[account];
+    }
+
+    function getBurnedAmount(address account) public view returns (uint256) {
+        return burnedAmounts[account];
+    }
+
+    function getTokenABalance() public view returns (uint256) {
+        return tokenA.balanceOf(address(this));
+    }
+
+    function setMiningContract(address newMiningContract) external onlyOwner {
+    require(newMiningContract != address(0), "Invalid mining contract address");
+    miningContract = ICryptoSovereignReserve(newMiningContract);
+    }
+
+    function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+}
