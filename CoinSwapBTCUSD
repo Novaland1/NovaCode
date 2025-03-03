@@ -1,0 +1,353 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/IERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Sender.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+interface IToken {
+    function mint(address account, uint256 amount) external;
+    function burn(uint256 amount, bytes memory data) external ;
+    function balanceOf(address account) external view returns (uint256);
+    function send(address recipient, uint256 amount, bytes calldata data) external;
+}
+
+contract CoinSwapBTC is IERC777Recipient, IERC777Sender, Ownable {
+    
+    IERC1820Registry private constant _erc1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    IToken public tokenA;
+    IToken public tokenB;
+    AggregatorV3Interface public priceFeed;
+
+    uint256 private constant DECIMALS = 10**18;
+    uint256 private constant PRICE_STALENESS_THRESHOLD = 24 hours;// Increase price expiration threshold
+
+    uint256 public contractTotalMintedTokenB;
+    uint256 public contractTotalBurnedTokenB;
+    uint256 public contractActualTokenA;
+
+    uint256 public lastValidPrice;
+    uint256 public lastUpdateTimestamp;
+
+
+    mapping(address => uint256) private mintedAmounts;
+    mapping(address => uint256) private burnedAmounts;
+
+    event TokenSwapped(address indexed from, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+    event TokenMinted(address indexed to, uint256 amount);
+    event PriceFeedUpdated(address indexed oldPriceFeed, address indexed newPriceFeed);
+
+    event TokenAAddressUpdated(address indexed oldAddress, address indexed newAddress);
+    event TokenBAddressUpdated(address indexed oldAddress, address indexed newAddress);
+    event PriceFeedAddressUpdated(address indexed oldAddress, address indexed newAddress);
+
+    constructor(
+    address _tokenA,
+    address _tokenB,
+    address _priceFeed,
+    address initialOwner
+    ) Ownable(msg.sender) {
+    require(_tokenA != address(0), "TokenA address cannot be zero");
+    require(_tokenB != address(0), "TokenB address cannot be zero");
+    require(_priceFeed != address(0), "PriceFeed address cannot be zero");
+    require(initialOwner != address(0), "Owner address cannot be zero");
+
+    tokenA = IToken(_tokenA);
+    tokenB = IToken(_tokenB);
+    priceFeed = AggregatorV3Interface(_priceFeed);
+
+    // Set up the operator
+    address[] memory operators = new address[](1);
+    operators[0] = address(this); // Set the current contract address as the operator
+
+    // Initialize price
+    (uint256 initialPrice, uint256 updatedAt) = _getLatestPrice();
+    require(initialPrice > 0, "Invalid initial price");
+    lastValidPrice = initialPrice;
+    lastUpdateTimestamp = updatedAt;
+    
+     // Register interfaces
+    _erc1820.setInterfaceImplementer(address(this), keccak256("ERC777TokensSender"), address(this));
+    _erc1820.setInterfaceImplementer(address(this), keccak256("ERC777TokensRecipient"), address(this));
+
+   }
+
+    function _getLatestPrice() internal view returns (uint256 price, uint256 updatedAt) {
+        (
+            ,
+            int256 answer,
+            ,
+            uint256 timestamp,
+            
+        ) = priceFeed.latestRoundData();
+        
+        require(answer > 0, "Invalid price feed response");
+        price = uint256(answer) * DECIMALS / 10**uint256(priceFeed.decimals());
+        updatedAt = timestamp;
+        return (price, updatedAt);
+    }
+
+    function getCurrentPrice() public view returns (uint256) {
+        try priceFeed.latestRoundData() returns (
+            uint80,
+            int256 answer,
+            uint256,
+            uint256 updatedAt,
+            uint80
+        ) {
+            if(answer > 0 && block.timestamp - updatedAt <= PRICE_STALENESS_THRESHOLD) {
+                return uint256(answer) * DECIMALS / 10**uint256(priceFeed.decimals());
+            }
+        } catch {}
+        
+        require(lastValidPrice > 0, "No valid price available");
+        require(block.timestamp - lastUpdateTimestamp <= PRICE_STALENESS_THRESHOLD, "Price too old");
+        return lastValidPrice;
+    }
+
+   function tokensReceived(
+    address /* operator */,    
+    address from,              
+    address /* to */,          
+    uint256 amount,            
+    bytes calldata /* userData */,      
+    bytes calldata /* operatorData */   
+   ) external override {
+    if (msg.sender == address(tokenA)) {
+        
+        handleTokenAReceived(from, amount);
+    } else if (msg.sender == address(tokenB)) {
+        
+        handleTokenBReceived(from, amount);
+    } else {
+        revert("Unsupported token");
+    }
+}
+
+   
+    function tokensToSend(
+    address _operator,
+    address _from,
+    address _to,
+    uint256 _amount,
+    bytes calldata _userData,
+    bytes calldata _operatorData
+    ) external override {
+    // empty implementation
+    }
+
+   function updatePrice() internal {
+    try priceFeed.latestRoundData() returns (
+        uint80 /* roundId */,
+        int256 answer,
+        uint256 /* startedAt */,
+        uint256 updatedAt,
+        uint80 /* answeredInRound */
+    ) {
+        if(answer > 0) {  // Only keep checks where the price is positive
+            uint256 newPrice = uint256(answer) * DECIMALS / 10**uint256(priceFeed.decimals());
+            lastValidPrice = newPrice;
+            lastUpdateTimestamp = updatedAt;
+        }
+    } catch {
+        // If the acquisition fails, continue to use the reserve exchange rate
+    }
+   }
+    
+
+    function handleTokenAReceived(address from, uint256 amount) internal {
+        require(amount > 0, "Amount must be greater than 0");
+        updatePrice(); // Update price
+        uint256 amountB = calculateTokenBAmount(amount);
+        require(amountB > 0, "Calculated amount B must be greater than 0");
+        
+       // Update TokenA balance
+        contractActualTokenA += amount;
+        
+        
+        try tokenB.mint(from, amountB) {
+            contractTotalMintedTokenB += amountB;
+            mintedAmounts[from] += amountB;
+            emit TokenSwapped(from, address(tokenA), address(tokenB), amount, amountB);
+        } catch {
+            revert("TokenB minting failed");
+        }
+    }
+
+    function handleTokenBReceived(address from, uint256 amount) internal {
+    require(amount > 0, "Amount must be greater than 0");
+    updatePrice();// Update price
+
+    uint256 amountA = calculateTokenAAmount(amount);
+    require(amountA > 0, "Calculated amount A must be greater than 0");
+    
+    // Get the balance of Token A of the contract
+    uint256 contractBalance = tokenA.balanceOf(address(this));
+    
+   // Try to destroy the Token first
+    try tokenB.burn(amount, "") {
+        contractTotalBurnedTokenB += amount;
+        burnedAmounts[from] += amount;
+        
+        if (contractBalance >= amountA) {
+            // Update state variables
+            contractActualTokenA = contractActualTokenA > amountA ? 
+                                 contractActualTokenA - amountA : 0;
+            
+            // If send fails, don't revert, keep trying mint
+            try tokenA.send(from, amountA, "") {
+                emit TokenSwapped(from, address(tokenB), address(tokenA), amount, amountA);
+            } catch {
+               // When send fails, try mint
+                try tokenA.mint(from, amountA) {
+                    emit TokenMinted(from, amountA);
+                    emit TokenSwapped(from, address(tokenB), address(tokenA), amount, amountA);
+                } catch {
+                    revert("Both transfer and minting failed");
+                }
+            }
+        } else {
+            // If the balance is insufficient, mint directly
+            try tokenA.mint(from, amountA) {
+                emit TokenMinted(from, amountA);
+                emit TokenSwapped(from, address(tokenB), address(tokenA), amount, amountA);
+            } catch {
+                revert("TokenA minting failed");
+            }
+        }
+    } catch {
+        revert("TokenB burn failed");
+    }
+    }
+
+    // Modify the calculation function to use the latest price acquisition method
+    function calculateTokenBAmount(uint256 amountA) public view returns (uint256) {
+        uint256 price = getCurrentPrice();
+        return (amountA * DECIMALS ) / price;
+    }
+
+    function calculateTokenAAmount(uint256 amountB) public view returns (uint256) {
+        uint256 price = getCurrentPrice();
+        return (amountB *  price ) /DECIMALS;
+    }
+
+   // Add a function to view the current exchange rate
+    function getLastValidPrice() public view returns (uint256) {
+        return lastValidPrice;
+    }
+
+    function getLastUpdateTimestamp() public view returns (uint256) {
+        return lastUpdateTimestamp;
+    }
+
+    function getChainlinkPrice() public view returns (uint256) {
+        (
+            ,
+            int256 answer,
+            ,
+            uint256 updatedAt,
+            
+        ) = priceFeed.latestRoundData();
+        
+        require(answer > 0, "Invalid price");
+        require(block.timestamp - updatedAt <= 1 hours, "Stale price");
+        
+        return uint256(answer) * DECIMALS / 10**uint256(priceFeed.decimals());
+    }
+
+    // View functions
+    function getTokenABalance() public view returns (uint256) {
+        return tokenA.balanceOf(address(this));
+    }
+
+    function getTokenBBalance() public view returns (uint256) {
+        return tokenB.balanceOf(address(this));
+    }
+    
+    function getMintedAmount(address account) public view returns (uint256) {
+        return mintedAmounts[account];
+    }
+
+    function getBurnedAmount(address account) public view returns (uint256) {
+        return burnedAmounts[account];
+    }
+
+    // Add emergency token retrieval function
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+        require(token != address(0), "Invalid token address");
+        require(amount > 0, "Amount must be greater than 0");
+        
+        if (token == address(tokenA)) {
+            try tokenA.send(owner(), amount, "") {
+                // success
+            } catch {
+                revert("TokenA withdrawal failed");
+            }
+        } else if (token == address(tokenB)) {
+            try tokenB.send(owner(), amount, "") {
+                // success
+            } catch {
+                revert("TokenB withdrawal failed");
+            }
+        } else {
+            revert("Unsupported token");
+        }
+    }
+
+   // Add a function to check the contract token balance
+    function getContractBalances() external view returns (uint256 balanceA, uint256 balanceB) {
+        balanceA = tokenA.balanceOf(address(this));
+        balanceB = tokenB.balanceOf(address(this));
+    }
+
+// Set TokenA address
+function setTokenAAddress(address newTokenAAddress) external onlyOwner {
+    require(newTokenAAddress != address(0), "Invalid address");
+    address oldAddress = address(tokenA);
+    tokenA = IToken(newTokenAAddress);
+    emit TokenAAddressUpdated(oldAddress, newTokenAAddress);
+}
+
+// Set TokenB address
+function setTokenBAddress(address newTokenBAddress) external onlyOwner {
+    require(newTokenBAddress != address(0), "Invalid address");
+    address oldAddress = address(tokenB);
+    tokenB = IToken(newTokenBAddress);
+    emit TokenBAddressUpdated(oldAddress, newTokenBAddress);
+}
+
+function setPriceFeedAddress(address newPriceFeedAddress) external onlyOwner {
+    require(newPriceFeedAddress != address(0), "Invalid address");
+    address oldAddress = address(priceFeed);
+    priceFeed = AggregatorV3Interface(newPriceFeedAddress);
+    emit PriceFeedAddressUpdated(oldAddress, newPriceFeedAddress);
+}
+
+// Query the currently set address
+function getContractAddresses() external view returns (
+    address tokenAAddress,
+    address tokenBAddress,
+    address priceFeedAddress
+) {
+    return (
+        address(tokenA),
+        address(tokenB),
+        address(priceFeed)
+    );
+}
+
+     function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+
+}
