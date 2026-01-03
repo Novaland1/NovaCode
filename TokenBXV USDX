@@ -68,8 +68,8 @@ contract TokenBXV is ERC777, IERC777Sender, IERC777Recipient, Ownable  {
     // inflation function
     uint256 private _totalValorhere = 1; // initial set 1，avoid 0 status
     // Define constants
-    uint256 public minMultiplier = 1e18 / 100;     // 默认1% (0.01 * 1e18)
-    uint256 public maxMultiplier = 5 * 1e18 / 100; // 默认5% (0.5 * 1e18)
+    uint256 public minMultiplier = 1e18 / 100;     // 1% (0.01 * 1e18)
+    uint256 public maxMultiplier = 5 * 1e18 / 100; // 5% (0.5 * 1e18)
     
     struct FeeStructure {
         uint256 threshold;
