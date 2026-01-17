@@ -1,0 +1,624 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC777/IERC777.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Sender.sol";
+import "@openzeppelin/contracts/token/ERC777/IERC777Recipient.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC1820Registry.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+import "./CryptoLandCitizenNFT4124.sol";
+import "./TokenAs2.sol";
+import "./NovaMeMe.sol";
+
+//If memes can bring more passion to the world, then we will give it free.
+//Blockchain may change the world, but the real change begins with our own awakening.
+
+contract CryptoSovereignReserve is Ownable, ReentrancyGuard, IERC777Sender, IERC777Recipient {
+    IERC1820Registry private constant erc1820registry = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+
+    AggregatorV3Interface public ethUsdPriceFeed;
+    CryptoLandCitizenNFT412 public nftContract;
+    TokenA public tokenA;
+    NovaMeMe public tokenMeMe;
+    
+    // Constants
+    uint256 private constant INITIAL_DAILY_RELEASE_AMOUNT = 10000 * 10**18;
+    uint256 private constant DAILY_DECREASE_RATE = 9990; // 99.9%, applied daily
+    uint256 private constant DECREASE_RATE_PRECISION = 10000;
+    uint256 private constant MIN_PARTICIPATION_AMOUNT = 0.0001 ether;
+    uint256 private constant SECONDS_PER_DAY = 86400;
+    uint256 private constant PRECISION = 1e9;
+    uint256 private constant MULTIPLIER_FACTOR = 20 * PRECISION;
+    uint256 private constant MULTIPLIER_INCREMENT = 1e4;
+    uint256 private constant TOTAL_RELEASE_100_YEARS = 241838856 * 10**18;
+    uint256 private constant INITIAL_PARTICIPANTS = 1;
+    uint256 private constant DECAY_RATE = 50;  // 5% per hour
+    uint256 private constant DECAY_PRECISION = 1000;
+    uint256 private constant FALLBACK_PRICE = 250000000000; // $2500 with 8 decimal places
+
+    uint256 private lastGasUsed;
+
+    // State variables
+    uint256 public currentPeriodParticipants;
+    uint256 public currentParticipants;
+    uint256 public lastUpdateTime;
+    uint256 public lastResetTime;
+    uint256 public accumulatedValue;
+    uint256 public totalParticipations;
+    uint256 public contractStartTime;
+    uint256 public lastUpdateTimestamp;
+    uint256 public lastDailyReleaseAmount;
+    uint256 public currentDailyReleaseAmount;
+    uint256 public currentReleaseRate;
+    uint256 public lastReleaseUpdateTimestamp;
+    uint256 public decreaseRateAdjustment;
+    uint256 public totalWeight;
+    uint256 public lastResetTimestamp;
+    uint256 public latestMiningEthAmount;
+    uint256 public latestMiningTokenAReward;
+    uint256 public latestMiningTimestamp;
+    uint256 private fallbackEthUsdPrice;
+    uint256 private lastEmittedPrice;
+    uint256 private lastEmittedPriceTimestamp;
+    uint256 public lastEstimationUpdateTimestamp;
+    address public etherReceiver;
+
+    uint256 public lastParticipantUpdateTime;
+    uint256 public accumulatedHours;
+
+    uint256 public lastDecayUpdateTime;
+    uint256 public decayedParticipants;
+    uint256 public initialTime = block.timestamp;
+
+    mapping(address => bool) public hasNFT;
+    mapping(address => uint256) public lastParticipationTimestamp;
+    
+
+    // Events
+    event NFTMinted(address indexed user, uint256 tokenId, uint256 valor);
+    event ValorUpdated(address indexed user, uint256 newValor);
+    event EthUsdPriceUpdated(uint256 newPrice, uint256 timestamp, string source);
+    event FallbackPriceUpdated(uint256 newPrice);
+    event ParticipantRewarded(address indexed participant, uint256 amount, uint256 weight);
+    event EtherReceiverChanged(address indexed newReceiver);
+    event EtherForwarded(address indexed to, uint256 amount);
+    event DecreaseRateAdjustmentUpdated(uint256 newAdjustment);
+    event DailyRateUpdated(uint256 newDailyReleaseAmount, uint256 newReleaseRate);
+    event EthUsdPriceFeedUpdated(address indexed newPriceFeed);
+    event DebugLog(string message, address indexed addr1, address indexed addr2, uint256 val1, uint256 val2);
+    event ParticipantCountUpdated(uint256 count, uint256 timestamp);
+    event ParticipantsReset(uint256 timestamp);
+    event RewardMinted(address indexed participant, uint256 amount, bool success);
+    event TokensReceived(address operator, address from, address to, uint256 amount, bytes userData, bytes operatorData);
+    event TokensSent(address operator, address from, address to, uint256 amount, bytes userData, bytes operatorData);
+    event TokenAAddressSet(address indexed newAddress);
+
+    constructor(
+        address initialEtherReceiver,
+        address initialOwner,
+        address _ethUsdPriceFeed,
+        address _nftContractAddress,
+        address _tokenAAddress,
+        address _tokenMeMeAddress
+    ) 
+        Ownable(initialOwner)
+    {
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeed);
+        nftContract = CryptoLandCitizenNFT412(_nftContractAddress);
+        tokenA = TokenA(_tokenAAddress);
+        tokenMeMe = NovaMeMe(_tokenMeMeAddress);
+
+        erc1820registry.setInterfaceImplementer(address(this), keccak256("ERC777TokensSender"), address(this));
+        erc1820registry.setInterfaceImplementer(address(this), keccak256("ERC777TokensRecipient"), address(this));
+    
+        contractStartTime = block.timestamp;
+        lastUpdateTimestamp = contractStartTime;
+        lastResetTimestamp = contractStartTime;
+        lastDailyReleaseAmount = INITIAL_DAILY_RELEASE_AMOUNT;
+        currentDailyReleaseAmount = INITIAL_DAILY_RELEASE_AMOUNT;
+        currentReleaseRate = currentDailyReleaseAmount;
+        lastReleaseUpdateTimestamp = block.timestamp;
+        etherReceiver = initialEtherReceiver;
+        decreaseRateAdjustment = DECREASE_RATE_PRECISION;
+        latestMiningEthAmount = 1 ether;
+        latestMiningTokenAReward = 1e18;
+
+        currentParticipants = INITIAL_PARTICIPANTS;
+        lastUpdateTime = block.timestamp;
+        lastEmittedPrice = FALLBACK_PRICE;
+        lastEmittedPriceTimestamp = block.timestamp;
+        fallbackEthUsdPrice = FALLBACK_PRICE;
+
+        lastParticipantUpdateTime = block.timestamp;
+        accumulatedHours = 0;
+
+        lastDecayUpdateTime = block.timestamp;
+        decayedParticipants = INITIAL_PARTICIPANTS;
+
+        emit EthUsdPriceUpdated(fallbackEthUsdPrice, lastEmittedPriceTimestamp, "initial");
+    }
+
+     function setTokenAAddress(address _tokenAAddress) external onlyOwner {
+        require(_tokenAAddress != address(0), "Invalid TokenA address");
+          tokenA = TokenA(_tokenAAddress);
+        emit TokenAAddressSet(_tokenAAddress);
+    }
+
+     function setTokenMeMeAddress(address _tokenMeMeAddress) external onlyOwner {
+        require(_tokenMeMeAddress != address(0), "Invalid TokenMeMe address");
+          tokenMeMe = NovaMeMe(_tokenMeMeAddress);
+        
+    }
+
+
+    receive() external payable {
+    if (msg.sender != owner()) {
+        require(msg.value >= MIN_PARTICIPATION_AMOUNT, "Insufficient ETH sent");
+        handleParticipation(msg.sender, msg.value);
+     // Calculate the time difference (seconds)
+        uint256 timeElapsed = block.timestamp - initialTime;
+        // 定义 10 年的秒数
+        uint256 tenYears = 10 * 365 days;
+        // Calculate the attenuation factor
+        uint256 decayFactor;
+        if (timeElapsed >= tenYears) {
+            decayFactor = 1; // Decays to 1 after 10 years
+        } else {
+            // Linear decay: from 1e18 to 1
+            decayFactor = 1e18 - (1e18 - 1) * timeElapsed / tenYears;
+        }
+
+        uint256 mintAmount = (msg.value * 1000 * 1e18) / MIN_PARTICIPATION_AMOUNT;
+        mintAmount = (mintAmount * decayFactor) / 1e18;
+
+        // Make sure the minting amount is not less than (msg.value * 1e18) / MIN_PARTICIPATION_AMOUNT)
+        if (mintAmount < (msg.value * 1e18) / MIN_PARTICIPATION_AMOUNT) {
+            mintAmount = (msg.value * 1e18) / MIN_PARTICIPATION_AMOUNT;
+        }
+
+       // Use try-catch to catch errors in the mint call
+        try tokenMeMe.mint(msg.sender, mintAmount) {
+           // Mint succeeded, continue execution
+        } catch {
+            // Mint failed, log or perform other logic
+            emit MintFailed(msg.sender, msg.value);
+        }    
+    }    
+    forwardEther(msg.value);
+    }
+
+   // Define an event to record the failure of mint
+    event MintFailed(address indexed participant, uint256 amount);
+
+    function handleParticipation(address participant, uint256 ethAmount) internal nonReentrant {
+    uint256 gasStart = gasleft();
+    uint256 currentTime = block.timestamp;
+    uint256 ethUsdPrice = updateAndGetEthUsdPrice();
+    
+    
+    //require(currentTime >= lastParticipationTimestamp[participant] + 1 days, "Can only participate once per day");
+    
+    if (currentTime >= lastResetTime + 1 days) {
+        resetParticipants();
+    }
+
+    updateReleaseRate();
+    
+    uint256 weight = calculateWeight(ethAmount);
+    uint256 reward = calculateReward(weight, ethAmount);
+    
+    updateParticipantCounts(currentTime);
+    updateMiningStats(ethAmount, reward);
+
+    uint256 gasUsed = gasStart - gasleft();
+    lastGasUsed = gasUsed;
+
+    mintRewardAndUpdateNFT(participant, reward, ethAmount, ethUsdPrice, gasStart);
+    
+  // keep the last participation time record for other statistical purposes
+    lastParticipationTimestamp[participant] = currentTime;
+    
+    emit ParticipantRewarded(participant, reward, weight);
+}
+
+   
+    function updateMiningStats(uint256 ethAmount, uint256 reward) internal {
+        latestMiningEthAmount = ethAmount;
+        latestMiningTokenAReward = reward;
+        latestMiningTimestamp = block.timestamp;
+        accumulatedValue += reward;
+       
+    }
+
+   function mintRewardAndUpdateNFT(address participant, uint256 reward,  uint256 ethAmount, uint256 ethUsdPrice, uint256 gasStart) internal {
+  // Maintain a larger range of random numbers
+    uint256 randomNumber = uint256(keccak256(abi.encodePacked(
+        block.timestamp,
+        block.prevrandao,
+        msg.sender,
+        blockhash(block.number-1),
+        tx.gasprice,
+        address(this).balance,
+        gasleft(),
+        reward,
+        ethAmount,
+        ethUsdPrice
+    ))) % 1_000_000 + 1; // 1-100_000 range
+    
+    
+    // Limit the range of weight and add steps
+    uint256 weight = ethAmount * PRECISION / MIN_PARTICIPATION_AMOUNT / 1000000000;
+
+   // Add step reduction
+    if (weight > 100) {
+    weight = 100 + (weight - 100) / 10;  // Divide the part exceeding 100 by 10
+   }
+    
+   
+    uint256 finalReward = reward ;  
+    uint256 participantCount = getCurrentParticipationCounts();  
+    finalReward = (finalReward * randomNumber) / (10000*10000 );  // Multiply the random number again and divide by the remainder
+    finalReward = (finalReward * weight) / participantCount ;  // Divide by a part first; // Finally multiply by weight/number of participants
+    
+    if(finalReward > INITIAL_DAILY_RELEASE_AMOUNT) {
+    finalReward = INITIAL_DAILY_RELEASE_AMOUNT / participantCount ;  
+    
+    }
+
+    tokenA.mint(participant, finalReward); 
+
+    
+      
+      // Calculate the gas consumed
+       uint256 gasUsed = gasStart - gasleft();
+       uint256 gasCostInWei = gasUsed * tx.gasprice;
+      // Calculate the USD price of ETH value (8 digits of precision)
+       uint256 ethAmountInUsd = (ethAmount * ethUsdPrice) / 1e18; // ethAmount is in wei
+      // Calculate the USD price of gas cost (8 digits of precision)
+       uint256 gasCostInUsd = (gasCostInWei * ethUsdPrice) / 1e18; // gasCostInWei is in wei
+      // Total USD value
+       uint256 totalUsdValue = (ethAmountInUsd*(1e18+1e18/2))/1e18 + gasCostInUsd;
+       // Convert to 6 digits of precision
+       int256 valor = int256(totalUsdValue / 1e2);  // Convert from 8-bit precision to 6-bit precision
+       // Call the updateValor function of the NFT contract and pass 6-digit precision valor
+       updateNFT(participant, valor);
+
+    
+    }
+
+
+    function getLastGasUsed() public view returns (uint256) {
+        return lastGasUsed;
+    }
+
+    function updateNFT(address participant, int256 valor) internal {
+        uint256 nftBalance = nftContract.balanceOf(participant);
+        if (nftBalance == 0) {
+            uint256 tokenId = nftContract.mint(participant);
+            nftContract.updateValor(tokenId, valor);
+            hasNFT[participant] = true;
+            emit NFTMinted(participant, tokenId, uint256(valor));
+        } else {
+            uint256 tokenId = nftContract.tokenOfOwnerByIndex(participant, nftBalance - 1);
+            nftContract.updateValor(tokenId, valor);
+            emit ValorUpdated(participant, uint256(valor));
+        }
+    }
+    function updateAndGetEthUsdPrice() public returns (uint256) {
+        emit DebugLog("Entering updateAndGetEthUsdPrice", address(0), address(0), 0, 0);
+
+        try ethUsdPriceFeed.latestRoundData() returns (
+            uint80, int256 answer, uint256, uint256, uint80
+        ) {
+            if (answer > 0) {
+                uint256 newPrice = uint256(answer);
+                lastEmittedPrice = newPrice;
+                lastEmittedPriceTimestamp = block.timestamp;
+                emit EthUsdPriceUpdated(newPrice, lastEmittedPriceTimestamp, "chainlink");
+                return newPrice;
+            }
+            emit DebugLog("Chainlink returned non-positive price", address(0), address(0), uint256(answer), 0);
+        } catch {
+            emit DebugLog("Chainlink call failed", address(0), address(0), 0, 0);
+        }
+
+        if (lastEmittedPrice > 0) {
+            emit EthUsdPriceUpdated(lastEmittedPrice, lastEmittedPriceTimestamp, "last_emitted");
+            return lastEmittedPrice;
+        }
+
+        require(fallbackEthUsdPrice > 0, "Fallback price not set");
+        lastEmittedPrice = fallbackEthUsdPrice;
+        lastEmittedPriceTimestamp = block.timestamp;
+        emit EthUsdPriceUpdated(fallbackEthUsdPrice, block.timestamp, "fallback");
+        return fallbackEthUsdPrice;
+    }
+
+    function setFallbackEthUsdPrice(uint256 _newPrice) public onlyOwner {
+        require(_newPrice > 0, "Price must be greater than zero");
+        fallbackEthUsdPrice = _newPrice;
+        emit FallbackPriceUpdated(_newPrice);
+    }
+
+    function getLastEmittedPrice() public view returns (uint256, uint256) {
+        return (lastEmittedPrice, lastEmittedPriceTimestamp);
+    }
+
+     function getCurrentEthUsdPrice() public view returns (uint256) {
+        try ethUsdPriceFeed.latestRoundData() returns (
+            uint80, int256 answer, uint256, uint256, uint80
+        ) {
+            if (answer > 0) {
+                return uint256(answer);
+            }
+        } catch {
+            // If Chainlink call fails, we fall through to the next option
+        }
+
+        if (lastEmittedPrice > 0) {
+            return lastEmittedPrice;
+        }
+
+        return fallbackEthUsdPrice;
+    }
+
+    function getTokenACurrentValue() public view returns (uint256) {
+        if (latestMiningTimestamp == 0 || latestMiningTokenAReward == 0) {
+            return 0;
+        }
+        
+        uint256 ethUsdPrice = lastEmittedPrice;
+        if (ethUsdPrice == 0 || latestMiningTokenAReward == 0) {
+            return 0;
+        }
+        
+        return (latestMiningEthAmount * ethUsdPrice * 1e6) / latestMiningTokenAReward;
+    }
+
+    function calculateAnnualValorReturn() public view returns (uint256) {
+        uint256 tokenAValue = getTokenACurrentValue();
+        uint256 totalValor = nftContract.getTotalValor();
+        
+        if (totalValor == 0) {
+            return 0;
+        }
+
+         return (TOTAL_RELEASE_100_YEARS * tokenAValue*1e6 ) / (totalValor*100);
+    }
+
+    function getEstimatedAnnualValorReturn() public view returns (uint256) {
+        return calculateAnnualValorReturn();
+    }
+
+    function getValorReturn() public view returns (uint256) {
+        return getEstimatedAnnualValorReturn();
+    }
+
+    function setNFTContract(address _nftContractAddress) external onlyOwner {
+        nftContract = CryptoLandCitizenNFT412(_nftContractAddress);
+    }
+
+    function setEthUsdPriceFeed(address _priceFeed) external onlyOwner {
+        ethUsdPriceFeed = AggregatorV3Interface(_priceFeed);
+        emit EthUsdPriceFeedUpdated(_priceFeed);
+    }
+
+    function updateReleaseRate() internal {
+        uint256 currentTime = block.timestamp;
+        uint256 timeSinceLastUpdate = currentTime - lastReleaseUpdateTimestamp;
+
+        if (timeSinceLastUpdate >= 1 days) {
+            lastDailyReleaseAmount = currentDailyReleaseAmount;
+            currentDailyReleaseAmount = (lastDailyReleaseAmount * DAILY_DECREASE_RATE) / DECREASE_RATE_PRECISION;
+
+            if (currentDailyReleaseAmount == 0) {
+                currentDailyReleaseAmount = INITIAL_DAILY_RELEASE_AMOUNT;
+            }
+
+            lastReleaseUpdateTimestamp = currentTime;
+            emit DailyRateUpdated(currentDailyReleaseAmount, currentDailyReleaseAmount);
+        }
+
+        currentReleaseRate = currentDailyReleaseAmount;
+    }
+    
+     
+    function calculateWeight(uint256 ethAmount) internal returns (uint256) {
+        uint256 weight = ethAmount * PRECISION / MIN_PARTICIPATION_AMOUNT / 1000000000;
+        totalWeight += weight;
+        return weight;
+    }
+
+    function calculateReward(uint256 weight, uint256 ethAmount) internal view returns (uint256) {
+    
+    require(ethAmount >= MIN_PARTICIPATION_AMOUNT, "Participation amount must be at least the minimum amount");
+    uint256 participantCount = getCurrentParticipationCounts();  
+    uint256 baseReward = (currentReleaseRate ) / (participantCount);  
+
+    if (ethAmount == MIN_PARTICIPATION_AMOUNT) {
+        
+        return baseReward;
+    }
+    
+    else {
+
+        uint256 weightReward = baseReward * weight ;
+        uint256 maxMultiplier = MULTIPLIER_FACTOR/PRECISION + weight ;
+        uint256 maxReward = (baseReward + weightReward / maxMultiplier)/participantCount;
+       
+        return maxReward;
+    }
+   }
+
+
+
+    function updateParticipantCounts(uint256 currentTime) internal {
+   // Apply attenuation first
+    applyDecay(currentTime);
+    
+    // Update actual participation count
+    decayedParticipants += 1;
+    currentPeriodParticipants += 1;
+    
+    //Only update statistics, do not participate in calculations
+    totalParticipations += 1;
+    
+    emit ParticipantCountUpdated(decayedParticipants, currentTime);
+    }
+
+    
+    function getCurrentParticipationCounts() public view returns (uint256) {
+    uint256 currentTime = block.timestamp;
+    uint256 elapsedHours = (currentTime - lastDecayUpdateTime) / 1 hours;
+    
+   // Only use the decaying number of participants for calculation
+    if (elapsedHours > 0) {
+        return calculateDecayedParticipants(decayedParticipants, elapsedHours);
+    }
+    return decayedParticipants;
+    }
+   
+    function calculateDecayedParticipants(uint256 currentParticipantCounts, uint256 elapsedHours) internal pure returns (uint256) {
+        uint256 remainingParticipants = currentParticipantCounts;
+        for (uint256 i = 0; i < elapsedHours; i++) {
+            remainingParticipants = (remainingParticipants * (DECAY_PRECISION - DECAY_RATE)) / DECAY_PRECISION;
+        }
+        return remainingParticipants > 1 ? remainingParticipants : 1;
+    }
+
+    
+     function applyDecay(uint256 currentTime) internal {
+        uint256 elapsedHours = (currentTime - lastDecayUpdateTime) / 1 hours;
+        
+        if (elapsedHours > 0) {
+            decayedParticipants = calculateDecayedParticipants(decayedParticipants, elapsedHours);
+            lastDecayUpdateTime = currentTime;
+        }
+    }
+
+     function getTotalHours() public view returns (uint256) {
+        uint256 currentTime = block.timestamp;
+        uint256 elapsedTime = currentTime - lastParticipantUpdateTime;
+        uint256 elapsedHours = elapsedTime / 1 hours;
+        return accumulatedHours + elapsedHours;
+    }
+   
+    function resetParticipants() internal {
+    if (decayedParticipants > 1) {
+        // Only keep the number of decay participants
+        decayedParticipants = getCurrentParticipationCounts();
+    } else {
+        decayedParticipants = INITIAL_PARTICIPANTS;
+    }
+    
+    // Reset the current cycle count
+    currentPeriodParticipants = 0;
+    lastDecayUpdateTime = block.timestamp;
+    lastResetTime = block.timestamp;
+    
+   // totalParticipations is not reset, the cumulative value is maintained
+    emit ParticipantsReset(block.timestamp);
+    }
+
+
+    function getCurrentPeriodParticipants() public view returns (uint256) {
+        return currentPeriodParticipants;
+    }
+
+    function getTotalParticipations() public view returns (uint256) {
+        return totalParticipations;
+    }
+
+    function getParticipationStats() public view returns (
+    uint256 currentDecayed,
+    uint256 currentPeriod,
+    uint256 total
+    ) {
+    return (
+        getCurrentParticipationCounts(),
+        currentPeriodParticipants,
+        totalParticipations
+    );
+    }
+    
+    function getAccumulatedValue() public view returns (uint256) {
+        return accumulatedValue;
+    }
+
+    function forwardEther(uint256 amount) internal {
+        require(etherReceiver != address(0), "Ether receiver not set");
+        (bool sent, ) = payable(etherReceiver).call{value: amount}("");
+        require(sent, "Failed to send ETH to receiver");
+        emit EtherForwarded(etherReceiver, amount);
+    }
+
+    function setEtherReceiver(address newReceiver) public onlyOwner {
+        require(newReceiver != address(0), "Invalid receiver address");
+        etherReceiver = newReceiver;
+        emit EtherReceiverChanged(newReceiver);
+    }
+
+    function setDecreaseRateAdjustment(uint256 newAdjustment) public onlyOwner {
+        require(newAdjustment > 0 && newAdjustment <= DECREASE_RATE_PRECISION, "Invalid adjustment value");
+        decreaseRateAdjustment = newAdjustment;
+        emit DecreaseRateAdjustmentUpdated(newAdjustment);
+    }
+
+    function executeFunction(address target, bytes memory data) public returns (bytes memory) {
+        require(isOwnerOrOwnedByOwner(msg.sender), "Not authorized");
+        require(target != address(0), "Invalid target address");
+        (bool success, bytes memory result) = target.call(data);
+        require(success, "Function call failed");
+        return result;
+    }
+
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external override {
+        require(msg.sender == address(tokenA), "Only TokenA can call this function");
+        emit TokensSent(operator, from, to, amount, userData, operatorData);
+    }
+
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external override {
+        require(msg.sender == address(tokenA), "Only TokenA can call this function");
+        emit TokensReceived(operator, from, to, amount, userData, operatorData);
+    }
+
+    function testTokensToSend(address to, uint256 amount) external onlyOwner {
+        tokenA.send(to, amount, "");
+    }
+
+    function testTokensReceived(uint256 amount) external {
+        require(msg.sender == owner(), "Only owner can call this function");
+        tokenA.operatorSend(msg.sender, address(this), amount, "", "");
+    }
+
+    function isOwnerOrOwnedByOwner(address account) public view returns (bool) {
+        if (account == owner()) {
+            return true;
+        }
+        try Ownable(account).owner() returns (address accountOwner) {
+            return accountOwner == owner();
+        } catch {
+            return false;
+        }
+    }
+} 
+
+
